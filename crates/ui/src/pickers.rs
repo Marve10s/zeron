@@ -440,27 +440,18 @@ struct ModelRowData {
     model: Model,
 }
 
-/// The foldable header above one provider's models (opencode connects many
-/// providers at once; t3code groups and folds them the same way).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderHeader {
     harness: HarnessId,
-    /// The provider half of the group's `provider/model` ids.
     id: String,
     name: SharedString,
-    /// Models in the group, shown on the header so a folded group still
-    /// says what it hides.
     count: usize,
     collapsed: bool,
 }
 
-/// One entry of the virtualized model list.
 #[derive(Debug, Clone)]
 enum ModelListRow {
     Provider(ProviderHeader),
-    /// `ordinal` counts model rows only, so the ⌘N chips skip headers.
-    /// `under_header` rows sit below their provider's header, which already
-    /// names the provider their tagline would repeat.
     Model {
         row: ModelRowData,
         ordinal: usize,
@@ -557,7 +548,7 @@ pub struct Pickers {
     /// [`ModelRowsKey`]: a 7k-model catalog rebuilt+ranked on every
     /// keystroke, arrow press AND render was the picker's open/scroll lag.
     model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelListRow>>)>>,
-    /// Bumped on every catalog/favorites/fold mutation; invalidates the cache.
+    /// Bumped on every catalog/favorites mutation; invalidates the cache.
     catalog_rev: u64,
     /// Hover/drag state of the floating menu scrollbar. One instance serves
     /// every picker list like `menu_scroll` does — the popups are mutually
@@ -1731,8 +1722,6 @@ impl Pickers {
             },
             |harness, model| favorites.contains(&(harness, model)),
         );
-        // A query ranks across providers and the favorites tab mixes
-        // harnesses, so only the plain opencode tab folds into groups.
         let grouped = query.is_empty()
             && self.model_rail == ModelRail::Harness
             && effective == Some(HarnessId::Opencode);
@@ -1783,8 +1772,6 @@ impl Pickers {
         }
     }
 
-    /// ⌘N: pick the Nth MODEL row — headers hold no slot, so the chips stay
-    /// 1…9 down the models whatever is folded above them.
     fn activate_model_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
         let ix = self
             .model_rows(cx)
@@ -1797,7 +1784,7 @@ impl Pickers {
 
     /// Pick the visible row at `ix` — a foreign-harness row (favorites /
     /// search) switches the harness first, exactly like clicking its rail
-    /// icon and then the model. A provider header folds or unfolds instead.
+    /// icon and then the model.
     fn activate_model_index(&mut self, ix: usize, cx: &mut Context<Self>) {
         let row = match self.model_rows(cx).get(ix).cloned() {
             Some(ModelListRow::Model { row, .. }) => row,
@@ -1816,9 +1803,6 @@ impl Pickers {
         self.pick_model(row.model.id, cx);
     }
 
-    /// Fold/unfold a provider group and persist it with the sticky defaults.
-    /// The header keeps its index (only rows BELOW it come and go), so the
-    /// keyboard highlight stays put.
     fn toggle_provider_collapsed(
         &mut self,
         harness: HarnessId,
@@ -3651,10 +3635,6 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// A provider group's foldable header. It sits in the same uniform list
-    /// as the models, so it mirrors a compact model row's box exactly (same
-    /// padding, a 22px control like the star) — uniform_list measures the
-    /// first item, and that is a header whenever nothing is starred.
     fn render_provider_header(
         &mut self,
         ix: usize,
@@ -3724,10 +3704,9 @@ impl Pickers {
     }
 
     /// One model row for the virtualized list. `ix` is the row's GLOBAL index
-    /// (hover-cursor and activation key on it); `ordinal` is its position
-    /// among MODEL rows, which the ⌘N chips number. The 2px inter-row gap is
-    /// baked into each item's bottom padding so every item is the same
-    /// height (uniform_list measures the first).
+    /// (⌘N chips, hover-cursor, and activation all key on it). The 2px
+    /// inter-row gap is baked into each item's bottom padding so every item
+    /// is the same height (uniform_list measures the first).
     fn render_model_row(
         &mut self,
         ix: usize,
@@ -3752,7 +3731,7 @@ impl Pickers {
         // under 64 providers — and rows were indistinguishable). The driver
         // ships the provider display name in `description`; other harnesses'
         // taglines read fine in the same slot. Skip when it just repeats the
-        // harness name, or the provider header the row sits under.
+        // harness name.
         let attribution: Option<SharedString> = row
             .model
             .description
@@ -4434,7 +4413,6 @@ fn scoped_model_rows<'a>(
     }
 }
 
-/// A plain list: every row is a model, numbered in order for the ⌘N chips.
 fn flat_model_rows(rows: Vec<ModelRowData>) -> Vec<ModelListRow> {
     rows.into_iter()
         .enumerate()
@@ -4446,12 +4424,6 @@ fn flat_model_rows(rows: Vec<ModelRowData>) -> Vec<ModelListRow> {
         .collect()
 }
 
-/// Fold a harness tab's rows into provider groups (field report: a few
-/// connected opencode providers make one undifferentiated list of hundreds).
-/// Starred rows stay pinned on top, outside any group, exactly where the
-/// ungrouped list floats them; the rest gather under one header per
-/// `provider/` id prefix, in catalog order. A folded group keeps its header
-/// and drops its rows. Fewer than two providers is not worth a header.
 fn group_by_provider(
     rows: Vec<ModelRowData>,
     is_favorite: impl Fn(&ModelRowData) -> bool,
@@ -4472,7 +4444,6 @@ fn group_by_provider(
             continue;
         };
         let at = *group_at.entry(provider.to_owned()).or_insert_with(|| {
-            // The driver ships the provider's display name as the tagline.
             let name = row
                 .model
                 .description
@@ -5953,8 +5924,6 @@ mod tests {
         }
     }
 
-    /// The list as the picker draws it: `#` lines are headers (`-` folded),
-    /// model lines lead with their ⌘N ordinal.
     fn drawn(rows: &[ModelListRow]) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
@@ -5972,7 +5941,6 @@ mod tests {
 
     #[test]
     fn provider_groups_pin_stars_fold_and_number_models_only() {
-        // Stars arrive floated to the top, as `scoped_model_rows` orders them.
         let rows = vec![
             provider_row("openai/gpt-mini", "OpenAI"),
             provider_row("anthropic/haiku", "Anthropic"),

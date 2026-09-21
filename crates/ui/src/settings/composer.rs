@@ -41,8 +41,6 @@ pub struct FavoriteModel {
     pub model: String,
 }
 
-/// One folded provider group in the picker — harness + the provider half of
-/// its `provider/model` ids (opencode is the only harness with groups today).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollapsedProvider {
@@ -78,7 +76,6 @@ pub struct ComposerDefaults {
     pub no_project: bool,
     /// Starred models (the picker's favorites rail), in starring order.
     pub favorites: Vec<FavoriteModel>,
-    /// Provider groups the user folded shut in the picker; absent = open.
     pub collapsed_providers: Vec<CollapsedProvider>,
 }
 
@@ -184,15 +181,12 @@ impl ComposerDefaults {
         }
     }
 
-    /// Whether a provider group is folded shut.
     pub fn is_provider_collapsed(&self, harness: HarnessId, provider: &str) -> bool {
         self.collapsed_providers
             .iter()
             .any(|c| c.harness == harness && c.provider == provider)
     }
 
-    /// Fold/unfold a provider group; returns whether it is folded AFTER the
-    /// toggle.
     pub fn toggle_provider_collapsed(&mut self, harness: HarnessId, provider: &str) -> bool {
         if let Some(at) = self
             .collapsed_providers
@@ -260,7 +254,6 @@ mod tests {
     #[test]
     fn provider_folds_survive_a_reload_and_older_files_load_open() {
         let dir = tempfile::tempdir().unwrap();
-        // A file written before folds existed has no such key.
         std::fs::write(
             ComposerDefaults::path(dir.path()),
             r#"{"harness":"opencode"}"#,
