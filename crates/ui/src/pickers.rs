@@ -440,6 +440,34 @@ struct ModelRowData {
     model: Model,
 }
 
+/// The foldable header above one provider's models (opencode connects many
+/// providers at once; t3code groups and folds them the same way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderHeader {
+    harness: HarnessId,
+    /// The provider half of the group's `provider/model` ids.
+    id: String,
+    name: SharedString,
+    /// Models in the group, shown on the header so a folded group still
+    /// says what it hides.
+    count: usize,
+    collapsed: bool,
+}
+
+/// One entry of the virtualized model list.
+#[derive(Debug, Clone)]
+enum ModelListRow {
+    Provider(ProviderHeader),
+    /// `ordinal` counts model rows only, so the ⌘N chips skip headers.
+    /// `under_header` rows sit below their provider's header, which already
+    /// names the provider their tagline would repeat.
+    Model {
+        row: ModelRowData,
+        ordinal: usize,
+        under_header: bool,
+    },
+}
+
 /// Which picker popover is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -528,8 +556,8 @@ pub struct Pickers {
     /// Flattened rows the list/keyboard/⌘N all walk, cached per
     /// [`ModelRowsKey`]: a 7k-model catalog rebuilt+ranked on every
     /// keystroke, arrow press AND render was the picker's open/scroll lag.
-    model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelRowData>>)>>,
-    /// Bumped on every catalog/favorites mutation; invalidates the cache.
+    model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelListRow>>)>>,
+    /// Bumped on every catalog/favorites/fold mutation; invalidates the cache.
     catalog_rev: u64,
     /// Hover/drag state of the floating menu scrollbar. One instance serves
     /// every picker list like `menu_scroll` does — the popups are mutually
@@ -955,7 +983,7 @@ impl Pickers {
         if self.open_kind() != Some(PickerKind::HarnessModel) {
             return false;
         }
-        self.activate_model_index(slot, cx);
+        self.activate_model_slot(slot, cx);
         cx.notify();
         true
     }
@@ -1657,7 +1685,7 @@ impl Pickers {
     /// restricts every view to its own harness.
     /// Cached [`Self::visible_model_rows`]: selection/highlight changes and
     /// re-renders share one flattened list until an input actually changes.
-    fn model_rows(&self, cx: &App) -> std::sync::Arc<Vec<ModelRowData>> {
+    fn model_rows(&self, cx: &App) -> std::sync::Arc<Vec<ModelListRow>> {
         let key = ModelRowsKey {
             query: self.search.read(cx).text().trim().to_string(),
             rail: self.model_rail,
@@ -1675,7 +1703,7 @@ impl Pickers {
         rows
     }
 
-    fn visible_model_rows(&self, cx: &App) -> Vec<ModelRowData> {
+    fn visible_model_rows(&self, cx: &App) -> Vec<ModelListRow> {
         let effective = self.effective_harness(cx);
         let mut descriptors = self.rail_descriptors(cx);
         if self.harness_locked(cx) {
@@ -1690,7 +1718,7 @@ impl Pickers {
             .map(|f| (f.harness, f.model.as_str()))
             .collect();
         let query = self.search.read(cx).text().trim().to_string();
-        scoped_model_rows(
+        let rows = scoped_model_rows(
             &query,
             self.model_rail,
             effective,
@@ -1702,6 +1730,22 @@ impl Pickers {
                     .map(|models| models.as_slice())
             },
             |harness, model| favorites.contains(&(harness, model)),
+        );
+        // A query ranks across providers and the favorites tab mixes
+        // harnesses, so only the plain opencode tab folds into groups.
+        let grouped = query.is_empty()
+            && self.model_rail == ModelRail::Harness
+            && effective == Some(HarnessId::Opencode);
+        if !grouped {
+            return flat_model_rows(rows);
+        }
+        group_by_provider(
+            rows,
+            |row| favorites.contains(&(row.harness, row.model.id.as_str())),
+            |provider| {
+                self.defaults
+                    .is_provider_collapsed(HarnessId::Opencode, provider)
+            },
         )
     }
 
@@ -1714,7 +1758,9 @@ impl Pickers {
         self.model_rows(cx)
             .iter()
             .position(|row| {
-                Some(row.harness) == effective && selected.as_deref() == Some(row.model.id.as_str())
+                matches!(row, ModelListRow::Model { row, .. }
+                    if Some(row.harness) == effective
+                        && selected.as_deref() == Some(row.model.id.as_str()))
             })
             .unwrap_or(0)
     }
@@ -1737,12 +1783,29 @@ impl Pickers {
         }
     }
 
+    /// ⌘N: pick the Nth MODEL row — headers hold no slot, so the chips stay
+    /// 1…9 down the models whatever is folded above them.
+    fn activate_model_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
+        let ix = self
+            .model_rows(cx)
+            .iter()
+            .position(|row| matches!(row, ModelListRow::Model { ordinal, .. } if *ordinal == slot));
+        if let Some(ix) = ix {
+            self.activate_model_index(ix, cx);
+        }
+    }
+
     /// Pick the visible row at `ix` — a foreign-harness row (favorites /
     /// search) switches the harness first, exactly like clicking its rail
-    /// icon and then the model.
+    /// icon and then the model. A provider header folds or unfolds instead.
     fn activate_model_index(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.model_rows(cx).get(ix).cloned() else {
-            return;
+        let row = match self.model_rows(cx).get(ix).cloned() {
+            Some(ModelListRow::Model { row, .. }) => row,
+            Some(ModelListRow::Provider(header)) => {
+                self.toggle_provider_collapsed(header.harness, &header.id, cx);
+                return;
+            }
+            None => return,
         };
         if self.effective_harness(cx) != Some(row.harness) {
             if self.harness_locked(cx) {
@@ -1751,6 +1814,21 @@ impl Pickers {
             self.pick_harness(row.harness, cx);
         }
         self.pick_model(row.model.id, cx);
+    }
+
+    /// Fold/unfold a provider group and persist it with the sticky defaults.
+    /// The header keeps its index (only rows BELOW it come and go), so the
+    /// keyboard highlight stays put.
+    fn toggle_provider_collapsed(
+        &mut self,
+        harness: HarnessId,
+        provider: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.defaults.toggle_provider_collapsed(harness, provider);
+        self.save_defaults();
+        self.catalog_rev += 1;
+        cx.notify();
     }
 
     /// Star/unstar a model and persist it with the sticky defaults.
@@ -2282,7 +2360,7 @@ impl Pickers {
             && let Ok(n) = event.keystroke.key.parse::<usize>()
             && (1..=9).contains(&n)
         {
-            self.activate_model_index(n - 1, cx);
+            self.activate_model_slot(n - 1, cx);
             cx.notify();
             return;
         }
@@ -3452,9 +3530,22 @@ impl Pickers {
                         entity.update(app, |this, cx| {
                             range
                                 .filter_map(|ix| {
-                                    row_data
-                                        .get(ix)
-                                        .map(|row| this.render_model_row(ix, row, cx))
+                                    row_data.get(ix).map(|row| match row {
+                                        ModelListRow::Provider(header) => {
+                                            this.render_provider_header(ix, header, cx)
+                                        }
+                                        ModelListRow::Model {
+                                            row,
+                                            ordinal,
+                                            under_header,
+                                        } => this.render_model_row(
+                                            ix,
+                                            *ordinal,
+                                            *under_header,
+                                            row,
+                                            cx,
+                                        ),
+                                    })
                                 })
                                 .collect::<Vec<AnyElement>>()
                         })
@@ -3560,13 +3651,88 @@ impl Pickers {
             .into_any_element()
     }
 
+    /// A provider group's foldable header. It sits in the same uniform list
+    /// as the models, so it mirrors a compact model row's box exactly (same
+    /// padding, a 22px control like the star) — uniform_list measures the
+    /// first item, and that is a header whenever nothing is starred.
+    fn render_provider_header(
+        &mut self,
+        ix: usize,
+        header: &ProviderHeader,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).for_popup();
+        let mut el = div()
+            .id(("model-provider", ix))
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .cursor_pointer();
+        if ix == self.active {
+            el = el.bg(crate::theme::ink(0.05));
+        }
+        let el = el
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered && this.active != ix {
+                    this.active = ix;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_model_index(ix, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(header.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(header.count.to_string())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(if header.collapsed {
+                            crate::icons::ALT_ARROW_RIGHT
+                        } else {
+                            crate::icons::ALT_ARROW_DOWN
+                        })
+                        .size(px(13.0))
+                        .text_color(theme.text_muted),
+                    ),
+            );
+        div().pb(px(2.0)).child(el).into_any_element()
+    }
+
     /// One model row for the virtualized list. `ix` is the row's GLOBAL index
-    /// (⌘N chips, hover-cursor, and activation all key on it). The 2px
-    /// inter-row gap is baked into each item's bottom padding so every item
-    /// is the same height (uniform_list measures the first).
+    /// (hover-cursor and activation key on it); `ordinal` is its position
+    /// among MODEL rows, which the ⌘N chips number. The 2px inter-row gap is
+    /// baked into each item's bottom padding so every item is the same
+    /// height (uniform_list measures the first).
     fn render_model_row(
         &mut self,
         ix: usize,
+        ordinal: usize,
+        under_header: bool,
         row: &ModelRowData,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3586,11 +3752,12 @@ impl Pickers {
         // under 64 providers — and rows were indistinguishable). The driver
         // ships the provider display name in `description`; other harnesses'
         // taglines read fine in the same slot. Skip when it just repeats the
-        // harness name.
+        // harness name, or the provider header the row sits under.
         let attribution: Option<SharedString> = row
             .model
             .description
             .as_deref()
+            .filter(|_| !under_header)
             .map(str::trim)
             .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(harness_name.as_ref()))
             .map(|d| SharedString::from(d.to_owned()));
@@ -3719,8 +3886,8 @@ impl Pickers {
                 this.activate_model_index(ix, cx);
             }))
             .child(body);
-        if ix < 9 {
-            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+        if ordinal < 9 {
+            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ordinal + 1)));
         }
         el = el.child(
             div()
@@ -4265,6 +4432,96 @@ fn scoped_model_rows<'a>(
                 .collect()
         }
     }
+}
+
+/// A plain list: every row is a model, numbered in order for the ⌘N chips.
+fn flat_model_rows(rows: Vec<ModelRowData>) -> Vec<ModelListRow> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(ordinal, row)| ModelListRow::Model {
+            row,
+            ordinal,
+            under_header: false,
+        })
+        .collect()
+}
+
+/// Fold a harness tab's rows into provider groups (field report: a few
+/// connected opencode providers make one undifferentiated list of hundreds).
+/// Starred rows stay pinned on top, outside any group, exactly where the
+/// ungrouped list floats them; the rest gather under one header per
+/// `provider/` id prefix, in catalog order. A folded group keeps its header
+/// and drops its rows. Fewer than two providers is not worth a header.
+fn group_by_provider(
+    rows: Vec<ModelRowData>,
+    is_favorite: impl Fn(&ModelRowData) -> bool,
+    is_collapsed: impl Fn(&str) -> bool,
+) -> Vec<ModelListRow> {
+    struct Group {
+        id: String,
+        name: SharedString,
+        rows: Vec<ModelRowData>,
+    }
+    let mut pinned = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut group_at: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        let provider = row.model.id.split_once('/').map(|(provider, _)| provider);
+        let Some(provider) = provider.filter(|_| !is_favorite(&row)) else {
+            pinned.push(row);
+            continue;
+        };
+        let at = *group_at.entry(provider.to_owned()).or_insert_with(|| {
+            // The driver ships the provider's display name as the tagline.
+            let name = row
+                .model
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(provider);
+            groups.push(Group {
+                id: provider.to_owned(),
+                name: SharedString::from(name.to_owned()),
+                rows: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        groups[at].rows.push(row);
+    }
+    if groups.len() < 2 {
+        return flat_model_rows(
+            pinned
+                .into_iter()
+                .chain(groups.into_iter().flat_map(|group| group.rows))
+                .collect(),
+        );
+    }
+    let mut out = flat_model_rows(pinned);
+    let mut ordinal = out.len();
+    for group in groups {
+        let collapsed = is_collapsed(&group.id);
+        let harness = group.rows[0].harness;
+        out.push(ModelListRow::Provider(ProviderHeader {
+            harness,
+            id: group.id,
+            name: group.name,
+            count: group.rows.len(),
+            collapsed,
+        }));
+        if collapsed {
+            continue;
+        }
+        for row in group.rows {
+            out.push(ModelListRow::Model {
+                row,
+                ordinal,
+                under_header: true,
+            });
+            ordinal += 1;
+        }
+    }
+    out
 }
 
 /// Centered muted note filling an empty model list ("No models found").
@@ -5683,6 +5940,72 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model.id, "glm-5.2-b");
+    }
+
+    fn provider_row(id: &str, provider_name: &str) -> ModelRowData {
+        ModelRowData {
+            harness: HarnessId::Opencode,
+            harness_name: "OpenCode".into(),
+            model: Model {
+                description: Some(provider_name.into()),
+                ..bare_model(id, id)
+            },
+        }
+    }
+
+    /// The list as the picker draws it: `#` lines are headers (`-` folded),
+    /// model lines lead with their ⌘N ordinal.
+    fn drawn(rows: &[ModelListRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                ModelListRow::Provider(header) => format!(
+                    "#{} {} ({}){}",
+                    header.id,
+                    header.name,
+                    header.count,
+                    if header.collapsed { " -" } else { "" }
+                ),
+                ModelListRow::Model { row, ordinal, .. } => format!("{ordinal} {}", row.model.id),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn provider_groups_pin_stars_fold_and_number_models_only() {
+        // Stars arrive floated to the top, as `scoped_model_rows` orders them.
+        let rows = vec![
+            provider_row("openai/gpt-mini", "OpenAI"),
+            provider_row("anthropic/haiku", "Anthropic"),
+            provider_row("anthropic/opus", "Anthropic"),
+            provider_row("openai/gpt-5", "OpenAI"),
+        ];
+        let grouped = group_by_provider(
+            rows,
+            |row| row.model.id == "openai/gpt-mini",
+            |provider| provider == "anthropic",
+        );
+        assert_eq!(
+            drawn(&grouped),
+            [
+                "0 openai/gpt-mini",
+                "#anthropic Anthropic (2) -",
+                "#openai OpenAI (1)",
+                "1 openai/gpt-5",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_provider_gets_no_header() {
+        let rows = vec![
+            provider_row("opencode/big-pickle", "OpenCode Zen"),
+            provider_row("opencode/muse", "OpenCode Zen"),
+        ];
+        let grouped = group_by_provider(rows, |_| false, |_| true);
+        assert_eq!(
+            drawn(&grouped),
+            ["0 opencode/big-pickle", "1 opencode/muse"]
+        );
     }
 
     #[test]
