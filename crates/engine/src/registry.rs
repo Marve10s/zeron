@@ -2,7 +2,7 @@
 //! slots resolved on first use (claude-code spawns subprocess discovery; codex/cursor
 //! later). Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
 //!
-//! Also owns the device's harness ENABLEMENT (Settings → Agents): which harnesses
+//! Also owns the device's harness ENABLEMENT (Settings → Providers): which harnesses
 //! this device's composer offers, persisted in `{data_dir}/harness-prefs.json`.
 //! Per-device because CLI installs are — a viewer retargets the settings page at
 //! another device and edits THAT device's set over the forwarded RPCs.
@@ -30,7 +30,10 @@ pub struct HarnessDescriptor {
     /// field never read as uninstallable.
     #[serde(default = "default_installed")]
     pub installed: bool,
-    /// Whether the listing device offers this harness (Settings → Agents).
+    /// Explicit CLI installation is available on this listing device.
+    #[serde(default)]
+    pub can_install: bool,
+    /// Whether the listing device offers this harness (Settings → Providers).
     /// `None` — the catalog came from an engine predating the setting — means
     /// "unknown": consumers fall back to detection (see [`descriptor_enabled`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,20 +62,13 @@ fn auto_enabled(id: HarnessId) -> bool {
     id != HarnessId::Mock
 }
 
-/// harnesses that stay off until the user turns them on. enabling antigravity
-/// downloads a large server and runs a browser sign-in, which detection alone
-/// must never set off.
-fn opt_in(id: HarnessId) -> bool {
-    id == HarnessId::Antigravity
-}
-
 /// A descriptor's effective enabled flag. `None` — a catalog from an engine
 /// predating the setting — falls back to detection, the same rule new devices
 /// start from (see [`HarnessRegistry::enabled_set`]).
 pub fn descriptor_enabled(descriptor: &HarnessDescriptor) -> bool {
-    descriptor.enabled.unwrap_or_else(|| {
-        descriptor.installed && auto_enabled(descriptor.id) && !opt_in(descriptor.id)
-    })
+    descriptor
+        .enabled
+        .unwrap_or_else(|| descriptor.installed && auto_enabled(descriptor.id))
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -83,6 +79,7 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         steering_mode: harness.steering_mode(),
         reasoning_levels: harness.reasoning_levels().to_vec(),
         installed: harness.installed(),
+        can_install: false,
         enabled: None,
     }
 }
@@ -95,8 +92,6 @@ struct HarnessPrefsFile {
     /// so the file only records "no" — an agent installed later turns itself
     /// on without a trip to Settings.
     disabled: Vec<HarnessId>,
-    /// the user's explicit opt-ins, for the harnesses [`opt_in`] keeps off.
-    opted_in: Vec<HarnessId>,
     titles: TitleSettings,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
@@ -129,12 +124,20 @@ enum Slot {
 }
 
 pub struct HarnessRegistry {
+    pub(crate) installs: crate::rpc::Installations,
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
     /// This device's enabled set; `None` inner value = the default set.
     prefs: Mutex<HarnessPrefsFile>,
     /// Where the prefs persist; `None` (tests, bare registries) skips writes.
     prefs_path: Mutex<Option<PathBuf>>,
+    /// Fair per-harness execution gates. Runs and title generation hold a
+    /// shared lease; an accepted update queues an exclusive lease. Tokio's
+    /// write-preferring FIFO policy prevents a stream of new runs from
+    /// starving an update that is already waiting.
+    gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::RwLock<()>>>>,
+    pending_updates: Mutex<std::collections::HashSet<HarnessId>>,
+    update_generation: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for HarnessRegistry {
@@ -144,12 +147,160 @@ impl Default for HarnessRegistry {
 }
 
 impl HarnessRegistry {
+    pub async fn discover_models(
+        &self,
+        id: HarnessId,
+    ) -> Result<Vec<zeron_proto::Model>, HarnessError> {
+        let lease = Arc::new(self.execution_lease(id).await);
+        self.discover_models_with_lease(id, lease).await
+    }
+
+    /// A caller such as titling already holds a lease. Reacquiring after an
+    /// update queues would deadlock it against its own existing reader.
+    pub(crate) async fn discover_models_with_lease(
+        &self,
+        id: HarnessId,
+        lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Vec<zeron_proto::Model>, HarnessError> {
+        let harness = self.resolve(id)?;
+        tokio::spawn(async move {
+            // An RPC cancellation must not drop the gate before the probe's
+            // own deadline and child cleanup finish.
+            let _lease = lease;
+            harness.models().await
+        })
+        .await
+        .map_err(|error| HarnessError::Protocol(format!("model discovery task failed: {error}")))?
+    }
+
+    pub async fn discover_commands(
+        &self,
+        id: HarnessId,
+        cwd: &Path,
+    ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        let cwd = cwd.to_owned();
+        let lease = self.execution_lease(id).await;
+        let harness = self.resolve(id)?;
+        tokio::spawn(async move {
+            let _lease = lease;
+            harness.commands_for(&cwd).await
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::Protocol(format!("command discovery task failed: {error}"))
+        })?
+    }
+
+    pub async fn discover_skills(
+        &self,
+        id: HarnessId,
+        cwd: &Path,
+    ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
+        let cwd = cwd.to_owned();
+        let lease = self.execution_lease(id).await;
+        let harness = self.resolve(id)?;
+        tokio::spawn(async move {
+            // Retain the read lease through the adapter's deadline and cleanup,
+            // even when the requesting RPC is dropped.
+            let _lease = lease;
+            harness.skills(&cwd).await
+        })
+        .await
+        .map_err(|error| HarnessError::Protocol(format!("skill discovery task failed: {error}")))?
+    }
+
     pub fn new() -> Self {
+        let (update_generation, _) = tokio::sync::watch::channel(0);
         Self {
+            installs: Default::default(),
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
             prefs: Mutex::new(HarnessPrefsFile::default()),
             prefs_path: Mutex::new(None),
+            gates: Mutex::new(HashMap::new()),
+            pending_updates: Mutex::new(std::collections::HashSet::new()),
+            update_generation,
+        }
+    }
+
+    fn gate(&self, id: HarnessId) -> Arc<tokio::sync::RwLock<()>> {
+        self.gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    /// Shared lease held for the full lifetime of a harness subprocess.
+    pub async fn execution_lease(&self, id: HarnessId) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        let mut updates = self.update_generation.subscribe();
+        loop {
+            // The marker closes the small begin-update → writer-future polling
+            // gap. Watch retains a generation change, so an update finishing
+            // between this check and `changed()` cannot lose the wakeup.
+            if self.update_pending(id) {
+                let _ = updates.changed().await;
+                continue;
+            }
+            let lease = self.gate(id).read_owned().await;
+            if !self.update_pending(id) {
+                return lease;
+            }
+            drop(lease);
+        }
+    }
+
+    /// Exclusive lease held from immediately before update mutation through
+    /// post-install verification.
+    pub async fn update_lease(&self, id: HarnessId) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.gate(id).write_owned().await
+    }
+
+    /// Mark an accepted update before queueing its writer. Existing persistent
+    /// runtimes use this signal to retire at their next turn boundary instead
+    /// of parking indefinitely while the writer waits.
+    pub fn begin_update(&self, id: HarnessId) {
+        self.pending_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id);
+    }
+
+    pub fn end_update(&self, id: HarnessId) {
+        self.pending_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+        self.update_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    pub fn update_pending(&self, id: HarnessId) -> bool {
+        self.pending_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id)
+    }
+
+    /// Run a synchronous dispatch-boundary action only if no update has been
+    /// accepted for this harness. Holding the marker lock through the action
+    /// gives direct steering a strict order against `begin_update`: either the
+    /// prompt is accepted first and belongs to the existing run, or it waits
+    /// behind the update through the ordinary dispatch path.
+    pub(crate) fn while_update_clear<T>(
+        &self,
+        id: HarnessId,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let pending = self
+            .pending_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending.contains(&id) {
+            None
+        } else {
+            Some(action())
         }
     }
 
@@ -204,20 +355,10 @@ impl HarnessRegistry {
         // takes `slots` then `order`, so holding `order` across a probe (which
         // takes `slots`) would invert the lock order.
         let registered: Vec<HarnessId> = self.order().iter().copied().collect();
-        let (disabled, opted_in) = {
-            let prefs = self.prefs();
-            (prefs.disabled.clone(), prefs.opted_in.clone())
-        };
+        let disabled = self.prefs().disabled.clone();
         registered
             .into_iter()
-            .filter(|id| {
-                let chosen = if opt_in(*id) {
-                    opted_in.contains(id)
-                } else {
-                    !disabled.contains(id)
-                };
-                auto_enabled(*id) && chosen && self.installed_for(*id)
-            })
+            .filter(|id| auto_enabled(*id) && !disabled.contains(id) && self.installed_for(*id))
             .collect()
     }
 
@@ -251,22 +392,14 @@ impl HarnessRegistry {
         match (on, enabled.contains(&id)) {
             (true, false) => {
                 let mut prefs = self.prefs();
-                if opt_in(id) {
-                    prefs.opted_in.push(id);
-                } else {
-                    prefs.disabled.retain(|h| *h != id);
-                }
+                prefs.disabled.retain(|h| *h != id);
             }
             (false, true) => {
                 if enabled.len() == 1 {
                     return Err("cannot disable the last enabled harness".into());
                 }
                 let mut prefs = self.prefs();
-                if opt_in(id) {
-                    prefs.opted_in.retain(|h| *h != id);
-                } else {
-                    prefs.disabled.push(id);
-                }
+                prefs.disabled.push(id);
             }
             _ => return Ok(()),
         }
@@ -381,6 +514,7 @@ impl HarnessRegistry {
                     None => return None,
                 };
                 descriptor.enabled = Some(enabled.contains(id));
+                descriptor.can_install = zeron_harness::install::can_install(*id);
                 Some(descriptor)
             })
             .collect()
@@ -455,6 +589,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
@@ -482,6 +617,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Ultra,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::CodexHarness::new().installed()),
@@ -489,15 +625,16 @@ pub fn default_registry() -> HarnessRegistry {
     );
     // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
     // subagent transcripts), same lazy pattern: the static descriptor mirrors
-    // CursorHarness exactly. Turn-boundary steering; no effort ladder.
+    // CursorHarness exactly. Native step-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Cursor,
             name: "Cursor".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::CursorHarness::new().installed()),
@@ -515,6 +652,7 @@ pub fn default_registry() -> HarnessRegistry {
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::devin().installed()),
@@ -536,6 +674,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::High,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::grok().installed()),
@@ -553,6 +692,7 @@ pub fn default_registry() -> HarnessRegistry {
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
@@ -576,6 +716,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
@@ -600,6 +741,7 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
             ],
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
@@ -617,6 +759,7 @@ pub fn default_registry() -> HarnessRegistry {
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
@@ -638,6 +781,7 @@ mod tests {
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
+            can_install: false,
             enabled: Some(true),
         };
         assert!(descriptor.steers_mid_turn());
@@ -664,6 +808,7 @@ mod tests {
                 steering_mode: SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
                 installed: true,
+                can_install: false,
                 enabled: None,
             },
             Box::new(|| false),
@@ -716,7 +861,7 @@ mod tests {
         let grok = registry.resolve(HarnessId::Grok).unwrap();
         assert_eq!(grok.id(), HarnessId::Grok);
         assert_eq!(grok.display_name(), "Grok");
-        assert_eq!(grok.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(grok.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             grok.reasoning_levels(),
             &[
@@ -729,12 +874,12 @@ mod tests {
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
-        assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(cursor.steering_mode(), SteeringMode::StepBoundary);
         assert!(cursor.reasoning_levels().is_empty());
         let devin = registry.resolve(HarnessId::Devin).unwrap();
         assert_eq!(devin.id(), HarnessId::Devin);
         assert_eq!(devin.display_name(), "Devin");
-        assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
         assert!(devin.reasoning_levels().is_empty());
         let hermes = registry.resolve(HarnessId::Hermes).unwrap();
         assert_eq!(hermes.id(), HarnessId::Hermes);
@@ -744,7 +889,7 @@ mod tests {
         let opencode = registry.resolve(HarnessId::Opencode).unwrap();
         assert_eq!(opencode.id(), HarnessId::Opencode);
         assert_eq!(opencode.display_name(), "OpenCode");
-        assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(opencode.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             opencode.reasoning_levels(),
             &[
@@ -763,7 +908,7 @@ mod tests {
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
-        assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             pi.reasoning_levels(),
             &[
@@ -796,12 +941,14 @@ mod tests {
         };
         let claude = parse("claude-code");
         assert!(claude.installed);
+        assert!(!claude.can_install);
         assert_eq!(claude.enabled, None);
         // Unknown enablement follows detection: a found CLI is offered...
         assert!(descriptor_enabled(&claude));
         // ...and one this device never found is not.
         let missing = HarnessDescriptor {
             installed: false,
+            can_install: false,
             ..parse("grok")
         };
         assert!(!descriptor_enabled(&missing));
@@ -818,6 +965,7 @@ mod tests {
                 steering_mode: SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
                 installed: true,
+                can_install: false,
                 enabled: None,
             },
             Box::new(move || installed),
@@ -900,6 +1048,7 @@ mod tests {
                 steering_mode: SteeringMode::TurnBoundary,
                 reasoning_levels: vec![],
                 installed: true,
+                can_install: false,
                 enabled: None,
             },
             Box::new(move || probe.load(Ordering::SeqCst)),
@@ -927,12 +1076,16 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_stays_off_until_the_user_opts_in() {
+    fn antigravity_detection_ignores_legacy_opt_in_and_preserves_opt_out() {
         let dir = tempfile::tempdir().unwrap();
         let registry = HarnessRegistry::new();
         registry.load_prefs(dir.path());
         test_slot(&registry, HarnessId::ClaudeCode, true);
         test_slot(&registry, HarnessId::Antigravity, true);
+        let prefs: HarnessPrefsFile =
+            serde_json::from_str(r#"{"optedIn":["antigravity"],"disabled":["antigravity"]}"#)
+                .unwrap();
+        *registry.prefs() = prefs;
         assert_eq!(registry.enabled_set(), vec![HarnessId::ClaudeCode]);
 
         registry.set_enabled(HarnessId::Antigravity, true).unwrap();
@@ -947,6 +1100,62 @@ mod tests {
 
         reloaded.set_enabled(HarnessId::Antigravity, false).unwrap();
         assert_eq!(reloaded.enabled_set(), vec![HarnessId::ClaudeCode]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_detection_subprocess() {
+        let Ok(expected) = std::env::var("ZERON_TEST_AGY_INSTALLED") else {
+            return;
+        };
+        let registry = HarnessRegistry::new();
+        let data = tempfile::tempdir().unwrap();
+        registry.load_prefs(data.path());
+        registry.register(Arc::new(zeron_harness::AcpHarness::antigravity()));
+        let expected = expected == "true";
+        assert_eq!(registry.descriptors()[0].installed, expected);
+        assert_eq!(
+            registry.enabled_set().contains(&HarnessId::Antigravity),
+            expected
+        );
+        assert_eq!(descriptor_enabled(&registry.descriptors()[0]), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_server_path_controls_detection_and_enablement() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let cli = bin.join("agy");
+        std::fs::write(&cli, "#!/bin/sh\nexit 91\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let server = bin.join("agy_acp_server.par");
+        for installed in [false, true] {
+            if installed {
+                std::fs::write(&server, "#!/bin/sh\nexit 91\n").unwrap();
+                std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "registry::tests::antigravity_detection_subprocess",
+                    "--nocapture",
+                ])
+                .env("HOME", home.path())
+                .env("PATH", &bin)
+                .env_remove("ANTIGRAVITY_ACP_EXECUTABLE")
+                .env("ZERON_NO_LOGIN_SHELL", "1")
+                .env("ZERON_TEST_AGY_INSTALLED", installed.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 
     /// The mock resolves on every machine, so detection alone would enable it
@@ -1094,5 +1303,170 @@ mod title_tests {
         let prefs: HarnessPrefsFile = serde_json::from_str(r#"{"disabled":["codex"]}"#).unwrap();
         assert_eq!(prefs.titles, TitleSettings::default());
         assert_eq!(prefs.disabled, vec![HarnessId::Codex]);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    struct DiscoveryHarness {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl Harness for DiscoveryHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Codex
+        }
+        fn display_name(&self) -> &str {
+            "Discovery fixture"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, HarnessError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(vec![])
+        }
+        async fn commands(&self) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: zeron_proto::RunRequest,
+            _: zeron_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+            HarnessError,
+        > {
+            unreachable!("discovery must not start a conversation")
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_waits_for_updates_and_keeps_lease_after_caller_cancellation() {
+        use std::time::Duration;
+        for commands in [false, true] {
+            let registry = Arc::new(HarnessRegistry::new());
+            let harness = Arc::new(DiscoveryHarness {
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            registry.register(harness.clone());
+            registry.begin_update(HarnessId::Codex);
+            let installing = registry.update_lease(HarnessId::Codex).await;
+            let caller = tokio::spawn({
+                let registry = registry.clone();
+                async move {
+                    if commands {
+                        registry
+                            .discover_commands(HarnessId::Codex, Path::new("/tmp"))
+                            .await
+                            .map(|_| ())
+                    } else {
+                        registry.discover_models(HarnessId::Codex).await.map(|_| ())
+                    }
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), harness.started.notified())
+                    .await
+                    .is_err()
+            );
+            drop(installing);
+            registry.end_update(HarnessId::Codex);
+            tokio::time::timeout(Duration::from_secs(1), harness.started.notified())
+                .await
+                .unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            registry.begin_update(HarnessId::Codex);
+            let mut writer = tokio::spawn({
+                let registry = registry.clone();
+                async move { registry.update_lease(HarnessId::Codex).await }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut writer)
+                    .await
+                    .is_err()
+            );
+            harness.release.notify_one();
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), writer)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            registry.end_update(HarnessId::Codex);
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_update_writer_precedes_later_dispatches() {
+        let registry = Arc::new(HarnessRegistry::new());
+        let running = registry.execution_lease(HarnessId::Codex).await;
+        registry.begin_update(HarnessId::Codex);
+        assert!(registry.update_pending(HarnessId::Codex));
+
+        let writer_registry = registry.clone();
+        let (writer_acquired_tx, writer_acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_writer_tx, release_writer_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _writer = writer_registry.update_lease(HarnessId::Codex).await;
+            let _ = writer_acquired_tx.send(());
+            let _ = release_writer_rx.await;
+        });
+        tokio::task::yield_now().await;
+
+        let reader_registry = registry.clone();
+        let (reader_acquired_tx, reader_acquired_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _reader = reader_registry.execution_lease(HarnessId::Codex).await;
+            let _ = reader_acquired_tx.send(());
+        });
+
+        drop(running);
+        writer_acquired_rx.await.unwrap();
+        let mut reader_acquired_rx = Box::pin(reader_acquired_rx);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                &mut reader_acquired_rx
+            )
+            .await
+            .is_err(),
+            "later reader jumped ahead of the queued update writer"
+        );
+        let _ = release_writer_tx.send(());
+        registry.end_update(HarnessId::Codex);
+        reader_acquired_rx.await.unwrap();
+        assert!(!registry.update_pending(HarnessId::Codex));
+    }
+
+    #[test]
+    fn update_marker_rejects_new_boundary_actions() {
+        let registry = HarnessRegistry::new();
+        assert_eq!(
+            registry.while_update_clear(HarnessId::Codex, || 42),
+            Some(42)
+        );
+        registry.begin_update(HarnessId::Codex);
+        let mut called = false;
+        assert_eq!(
+            registry.while_update_clear(HarnessId::Codex, || called = true),
+            None
+        );
+        assert!(!called);
+        registry.end_update(HarnessId::Codex);
     }
 }
